@@ -5,12 +5,13 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import API_VERSION, db
 from .audit import audit_timeline
+from .bundle import build_bundle, plan_digest, validate_bundle
 from .config import Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
@@ -23,6 +24,7 @@ from .schemas import (
     GateResult,
     GateWaveStatus,
     Issue,
+    PlanBundle,
     PlanCreate,
     PlanDeleted,
     PlanList,
@@ -49,16 +51,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.4.0",
+    version=API_VERSION,
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
         "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
         "impact of constraint changes on a stored plan, gate execution "
         "of a rollout against completed and failed services, preview "
-        "minimum rollback waves for the currently deployed services, and "
+        "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
-        "waves and dependency DAG."
+        "waves and dependency DAG, and archive plans offline as canonical, "
+        "content-addressed bundles (SHA-256) that can be re-imported "
+        "transactionally without re-solving."
     ),
     lifespan=lifespan,
 )
@@ -218,6 +222,13 @@ def create_plan(
         result_payload,
         output.wave_count,
         output.optimal,
+        plan_digest(
+            payload.name,
+            result_payload,
+            output.wave_count,
+            output.optimal,
+            API_VERSION,
+        ),
     )
     row = db.fetch_plan(conn, plan_id)
     assert row is not None
@@ -275,6 +286,67 @@ def delete_plan(
     if not db.delete_plan(conn, plan_id):
         return _plan_not_found(plan_id)  # type: ignore[return-value]
     return PlanDeleted(id=plan_id)
+
+
+@app.get(
+    "/plans/{plan_id}/bundle",
+    response_model=PlanBundle,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}},
+)
+def export_plan_bundle(
+    plan_id: int, conn: sqlite3.Connection = Depends(db.get_db)
+) -> dict:
+    """Export the plan as a canonical offline archive bundle (read-only).
+
+    The bundle carries the effective request constraints, the solved wave
+    result and version metadata. ``sha256`` is computed over the canonical
+    JSON serialization (sorted object keys, fixed array order, compact
+    separators, UTF-8) of every field except the digest itself, so the
+    archive can be verified offline and re-imported later.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+    return build_bundle(row, API_VERSION)
+
+
+@app.post(
+    "/plans/import",
+    response_model=PlanResult,
+    status_code=status.HTTP_201_CREATED,
+    tags=["plans"],
+    responses={422: {"model": ErrorBody}},
+)
+def import_plan_bundle(
+    payload: PlanBundle,
+    response: Response,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> PlanResult:
+    """Import a previously exported bundle as a new plan.
+
+    Validation runs before any write — schema, digest, dependency and
+    fault-domain references, then consistency of the carried waves with
+    the constraints — so a failed import writes nothing. The plan is
+    inserted in a single transaction with the carried waves stored
+    unchanged (no re-solving). Importing a bundle whose digest is already
+    known is idempotent: the existing plan is returned with status 200.
+    """
+    validated = validate_bundle(payload, app.state.settings)
+    plan_id, created = db.insert_plan_imported(
+        conn,
+        validated.name,
+        validated.request_payload,
+        validated.result_payload,
+        validated.wave_count,
+        validated.optimal,
+        validated.digest,
+    )
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    row = db.fetch_plan(conn, plan_id)
+    assert row is not None
+    return _row_to_result(row)
 
 
 @app.post(

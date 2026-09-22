@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---- Request models --------------------------------------------------------
 
@@ -207,6 +207,47 @@ class TimelineAuditRequest(BaseModel):
 class Wave(BaseModel):
     index: int = Field(..., ge=1, description="1-based wave number")
     services: list[str] = Field(..., description="Sorted service ids in wave")
+
+
+# ---- Offline archive (bundle) ----------------------------------------------
+
+
+class BundleResult(BaseModel):
+    """Solved wave result carried by an archive bundle.
+
+    On import the waves are stored unchanged — the bundle is an archive of
+    the solve output, not a request to re-solve.
+    """
+
+    waves: list[Wave] = Field(
+        ..., description="Ordered waves with contiguous 1-based indexes"
+    )
+    wave_count: int = Field(..., ge=0, description="Must equal len(waves)")
+    optimal: bool = Field(..., description="Solver optimality flag from export")
+
+
+class PlanBundle(BaseModel):
+    """Offline archive of a plan: signed payload plus its SHA-256 digest.
+
+    The digest covers the canonical JSON serialization (sorted object keys,
+    fixed array order, compact separators, UTF-8) of every field except
+    ``sha256`` itself. Used as the response of ``GET /plans/{id}/bundle``
+    and as the request body of ``POST /plans/import``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["release-wave-plan-bundle"]
+    format_version: Literal[1]
+    api_version: str = Field(..., min_length=1, max_length=64)
+    request: PlanCreate
+    result: BundleResult
+    sha256: str = Field(
+        ...,
+        pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 (hex) of the canonical serialization of the "
+        "bundle content",
+    )
 
 
 class Issue(BaseModel):

@@ -10,7 +10,11 @@
 （仍在运行）的服务给出**波次最少、顺序确定**的回滚波次预览（只读，不改方案）；
 `POST /plans/{id}/timeline-audit` 对发布后实际上报的逐服务执行时间线做审计：按
 已存波次与依赖校验启动顺序、返回每条违规与重叠毫秒数，并给出各波实际耗时与依赖
-DAG 上按服务实际耗时加权的关键链（只读，不改方案）。
+DAG 上按服务实际耗时加权的关键链（只读，不改方案）。`GET /plans/{id}/bundle`
+把方案导出为**带 SHA-256 摘要的规范 JSON 离线归档**（请求约束 + 求解结果 + 版本
+元数据，只读）；`POST /plans/import` 依次校验摘要、schema、依赖/故障域引用与
+波次一致性后，在**单个事务**内把归档原样恢复为新方案（波次结果不变、不重新求解），
+重复摘要幂等返回既有方案，导入失败零写入。
 容器启动时自动安装依赖并建表。
 
 ## 一条命令启动
@@ -443,6 +447,98 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 合法。审计为只读操作：重复请求得到相同结果（且与请求列表顺序无关），
 方案不存在返回 404。
 
+## 方案离线归档（GET /plans/{id}/bundle 与 POST /plans/import）
+
+方案可以导出为**自包含的离线归档（bundle）**，用于存档、审计或迁移到其它实例，
+之后通过导入接口原样恢复。**导出只读**，不写库；**导入不重新求解**，
+归档中的波次结果原样落库。
+
+### 导出：GET /plans/{id}/bundle
+
+```bash
+curl http://localhost:8000/plans/1/bundle -o plan-bundle.json
+```
+
+响应即归档内容，可直接保存为 JSON 文件：
+
+```json
+{
+  "format": "release-wave-plan-bundle",
+  "format_version": 1,
+  "api_version": "1.5.0",
+  "request": {
+    "name": "payment-platform",
+    "services": ["api", "auth", "cache", "db", "web"],
+    "dependencies": [
+      {"service": "api", "depends_on": "auth"},
+      {"service": "api", "depends_on": "db"},
+      {"service": "auth", "depends_on": "db"},
+      {"service": "web", "depends_on": "api"}
+    ],
+    "max_concurrency": 2,
+    "fault_domains": [{"domain": "az-a", "services": ["cache", "db"]}],
+    "max_waves": null
+  },
+  "result": {
+    "waves": [
+      {"index": 1, "services": ["db"]},
+      {"index": 2, "services": ["auth"]},
+      {"index": 3, "services": ["api"]},
+      {"index": 4, "services": ["cache", "web"]}
+    ],
+    "wave_count": 4,
+    "optimal": true
+  },
+  "sha256": "b1f6a2f2…（64 位十六进制）"
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `format` / `format_version` | 归档格式标识与格式版本（当前为 `release-wave-plan-bundle` / `1`） |
+| `api_version` | 导出该归档的服务版本 |
+| `request` | **生效的**请求约束（创建时校验、归并后的形式），导入时据此恢复 |
+| `result` | 求解得到的波次结果（`waves` / `wave_count` / `optimal`），导入时原样保留 |
+| `sha256` | 归档内容的摘要（见下） |
+
+**摘要计算（规范 JSON 固定排序）**：对除 `sha256` 外的全部字段做规范 JSON
+序列化——对象键按字典序排列、数组固定顺序（服务、依赖、故障域及其成员、波内
+服务均排序，波次按 `index` 升序）、紧凑分隔符（`,` / `:`）、UTF-8 编码——
+再取 SHA-256（小写十六进制）。相同方案内容永远得到相同摘要，与约束在列表中的
+排列顺序无关；重复导出的归档逐字节一致。
+
+### 导入：POST /plans/import
+
+```bash
+curl -X POST http://localhost:8000/plans/import \
+  -H 'Content-Type: application/json' \
+  -d @plan-bundle.json
+```
+
+导入按固定顺序校验，**任一阶段失败都不写库（零写入）**：
+
+1. **schema**：结构、字段类型、`sha256` 格式（64 位小写十六进制）、无多余
+   顶层字段（失败为 `validation_error`）；
+2. **摘要**：对内容重算规范序列化的 SHA-256 并与声明值比对
+   （`bundle_digest_mismatch`，context 附声明值与实算值）；
+3. **引用**：依赖与故障域引用的服务必须存在、无重复声明、依赖图无环——
+   与创建方案相同的 `unknown_*` / `duplicate_*` / `dependency_cycle` issue；
+4. **波次一致性**：归档波次必须与约束自洽——`wave_count` 与波次列表一致、
+   编号为 1..n 连续升序、每个服务恰好出现一次、不超过每波并发上限、
+   每个依赖都在严格更早的波次、同一故障域成员不同波
+   （`bundle_wave_*` 系列 issue，见错误表）。
+
+校验通过后**在一个事务内**写入新方案并返回 201 与完整方案（结构同
+`POST /plans` 响应）；归档波次结果**原样保留**，不重新求解。
+
+**幂等**：若归档摘要已存在（包括导入本实例刚导出的归档），不写入任何内容，
+直接返回既有方案，状态码 **200**（首次写入为 **201**）。重复导入同一归档
+永远得到同一个方案 id。归档不携带任何数据库 id——它按内容寻址，
+导入结果要么是既有方案（摘要相同），要么是一个全新方案。
+
+> 摘要覆盖 `api_version`：跨服务版本导入时归档仍可正常校验与恢复，
+> 但重新导出会按当前版本计算新摘要。
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -481,6 +577,12 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 | `duplicate_service` | 回滚预览请求中同一服务重复出现 |
 | `missing_service_timeline` / `duplicate_service_timeline` | 时间线审计：方案服务缺失时间窗口 / 同一服务出现多条窗口 |
 | `timeline_inverted` | 时间线审计：某服务 `finished_at` 早于 `started_at` |
+| `bundle_digest_mismatch` | 导入归档的 `sha256` 与内容的规范序列化摘要不一致（归档被篡改或损坏） |
+| `bundle_wave_count_mismatch` / `bundle_wave_index_invalid` | 归档 `wave_count` 与波次列表不符 / 波次编号不是 1..n 连续升序 |
+| `bundle_wave_service_mismatch` | 归档波次未恰好覆盖每个请求服务一次（context 分别列出缺失/未知/重复服务） |
+| `bundle_wave_concurrency_exceeded` | 归档某波服务数超过 `max_concurrency` |
+| `bundle_wave_dependency_violation` | 归档波次中某依赖未排在严格更早的波次 |
+| `bundle_wave_fault_domain_violation` | 归档波次中同一故障域的成员被排进同一波 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
 
 ## API 一览
@@ -492,6 +594,8 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 | POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
 | POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
 | POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：逐服务上报实际起止时间，校验前一波屏障与直接依赖，返回每条违规（服务/约束对象/阻塞服务/重叠毫秒）、各波实际耗时与按服务耗时加权的依赖 DAG 关键链；覆盖缺失、重复、时间倒置或未知服务 422 |
+| GET | `/plans/{id}/bundle` | 导出离线归档（只读）：规范 JSON 固定排序的请求约束 + 求解结果 + 版本元数据，附 SHA-256 摘要 |
+| POST | `/plans/import` | 导入归档：依次校验摘要、schema、依赖/故障域引用与波次一致性后，在单事务内写入新方案（波次结果原样保留、不重求解）；重复摘要幂等返回既有方案（200），新建 201；失败零写入 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
@@ -507,7 +611,8 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 | `PLANNER_PORT`（仅 compose） | `8000` | 宿主机映射端口 |
 
 数据存储在 compose 命名卷 `planner-data`（容器内 `/data`），重启不丢记录。
-数据库表在**每次启动时**通过 `CREATE TABLE IF NOT EXISTS` 自动创建，无需手工迁移。
+数据库表在**每次启动时**通过 `CREATE TABLE IF NOT EXISTS` 自动创建，无需手工迁移；
+旧版本创建的库会在启动时自动补齐 `digest` 列并为既有方案回填归档摘要。
 
 ## 本地开发（不用 Docker）
 
@@ -536,9 +641,10 @@ app/
   gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
   rollback.py   # 回滚预览：上线集合依赖闭包校验、反向边回滚波次生成
   audit.py      # 执行时间线审计：波次/依赖顺序校验、违规重叠毫秒、实际耗时与加权关键链
-  db.py         # SQLite 初始化与 CRUD
+  bundle.py     # 离线归档：规范 JSON 与 SHA-256 摘要、导出组装、导入校验（摘要/引用/波次一致性）
+  db.py         # SQLite 初始化（含 digest 列迁移与回填）与 CRUD、归档事务写入
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/归档导出导入/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt

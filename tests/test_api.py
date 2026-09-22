@@ -1538,3 +1538,478 @@ def test_timeline_audit_is_deterministic(client):
         for body in (payload, shuffled, payload)
     ]
     assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# GET /plans/{id}/bundle and POST /plans/import
+# ---------------------------------------------------------------------------
+
+from app import API_VERSION
+from app.bundle import bundle_digest
+
+ARCHIVE_PAYLOAD = {
+    "name": "payment-platform",
+    "services": ["web", "api", "auth", "db", "cache"],
+    "dependencies": [
+        {"service": "web", "depends_on": "api"},
+        {"service": "api", "depends_on": "auth"},
+        {"service": "api", "depends_on": "db"},
+        {"service": "auth", "depends_on": "db"},
+    ],
+    "max_concurrency": 2,
+    "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+}
+
+
+def _export_bundle(client, plan_id):
+    r = client.get(f"/plans/{plan_id}/bundle")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _resign(bundle):
+    """Recompute the digest after tampering, so the digest check passes."""
+    bundle["sha256"] = bundle_digest(
+        bundle["request"], bundle["result"], bundle["api_version"]
+    )
+    return bundle
+
+
+def _crafted_bundle(request, result):
+    return _resign(
+        {
+            "format": "release-wave-plan-bundle",
+            "format_version": 1,
+            "api_version": API_VERSION,
+            "request": request,
+            "result": result,
+        }
+    )
+
+
+def test_bundle_export_contains_constraints_result_and_metadata(client):
+    plan = _create_plan(client, ARCHIVE_PAYLOAD)
+    bundle = _export_bundle(client, plan["id"])
+
+    assert bundle["format"] == "release-wave-plan-bundle"
+    assert bundle["format_version"] == 1
+    assert bundle["api_version"] == API_VERSION
+
+    request = bundle["request"]
+    assert request["name"] == "payment-platform"
+    assert request["services"] == ["api", "auth", "cache", "db", "web"]
+    assert request["dependencies"] == [
+        {"service": "api", "depends_on": "auth"},
+        {"service": "api", "depends_on": "db"},
+        {"service": "auth", "depends_on": "db"},
+        {"service": "web", "depends_on": "api"},
+    ]
+    assert request["max_concurrency"] == 2
+    assert request["fault_domains"] == [
+        {"domain": "az-a", "services": ["cache", "db"]}
+    ]
+    assert request["max_waves"] is None
+
+    assert bundle["result"]["waves"] == plan["waves"]
+    assert bundle["result"]["wave_count"] == plan["wave_count"]
+    assert bundle["result"]["optimal"] is True
+
+    digest = bundle["sha256"]
+    assert len(digest) == 64
+    assert all(c in "0123456789abcdef" for c in digest)
+    # The digest is recomputable from the bundle content alone.
+    assert digest == bundle_digest(
+        bundle["request"], bundle["result"], bundle["api_version"]
+    )
+
+
+def test_bundle_export_is_deterministic(client):
+    plan = _create_plan(client, ARCHIVE_PAYLOAD)
+    first = _export_bundle(client, plan["id"])
+    second = _export_bundle(client, plan["id"])
+    assert first == second
+
+
+def test_bundle_export_is_read_only(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+    _export_bundle(client, plan["id"])
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_bundle_export_missing_plan_is_404(client):
+    r = client.get("/plans/9999/bundle")
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_import_roundtrip_preserves_wave_result(client):
+    plan = _create_plan(client, ARCHIVE_PAYLOAD)
+    bundle = _export_bundle(client, plan["id"])
+    assert client.delete(f"/plans/{plan['id']}").status_code == 200
+
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 201, r.text
+    imported = r.json()
+    assert imported["id"] != plan["id"]
+    assert imported["name"] == plan["name"]
+    assert imported["services"] == plan["services"]
+    assert imported["waves"] == plan["waves"]
+    assert imported["wave_count"] == plan["wave_count"]
+    assert imported["max_concurrency"] == plan["max_concurrency"]
+    assert imported["max_waves"] == plan["max_waves"]
+    assert imported["optimal"] == plan["optimal"]
+    as_pairs = lambda ds: sorted((d["service"], d["depends_on"]) for d in ds)
+    assert as_pairs(imported["dependencies"]) == as_pairs(plan["dependencies"])
+    as_domains = lambda fds: sorted(
+        (fd["domain"], sorted(fd["services"])) for fd in fds
+    )
+    assert as_domains(imported["fault_domains"]) == as_domains(plan["fault_domains"])
+
+    # Re-exporting the imported plan yields the identical archive.
+    reexported = _export_bundle(client, imported["id"])
+    assert reexported == bundle
+
+
+def test_import_of_own_export_returns_existing_plan(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+    total_before = client.get("/plans").json()["total"]
+
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == plan["id"]
+    assert client.get("/plans").json()["total"] == total_before
+
+
+def test_import_is_idempotent(client):
+    plan = _create_plan(client, ARCHIVE_PAYLOAD)
+    bundle = _export_bundle(client, plan["id"])
+    assert client.delete(f"/plans/{plan['id']}").status_code == 200
+
+    first = client.post("/plans/import", json=bundle)
+    assert first.status_code == 201, first.text
+    second = client.post("/plans/import", json=bundle)
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == first.json()["id"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_imported_plan_behaves_like_created_plan(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+    assert client.delete(f"/plans/{plan['id']}").status_code == 200
+    imported = client.post("/plans/import", json=bundle).json()
+
+    r = client.post(f"/plans/{imported['id']}/simulate", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["waves"] == plan["waves"]
+
+    r = client.post(f"/plans/{imported['id']}/gate", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["executable_services"] == ["a"]
+
+
+def test_import_digest_mismatch_is_422_and_writes_nothing(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+    assert client.delete(f"/plans/{plan['id']}").status_code == 200
+    bundle["result"]["wave_count"] = 99  # tamper without re-signing
+
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "bundle_digest_mismatch"
+    assert issue["constraint"] == "sha256"
+    assert issue["context"]["provided_digest"] != issue["context"]["computed_digest"]
+    assert client.get("/plans").json()["total"] == 0
+
+
+def test_import_schema_errors_are_validation_errors(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+
+    r = client.post("/plans/import", json=dict(bundle, sha256="not-a-hash"))
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    r = client.post("/plans/import", json=dict(bundle, format="other-format"))
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    r = client.post("/plans/import", json=dict(bundle, format_version=2))
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    missing_result = {k: v for k, v in bundle.items() if k != "result"}
+    r = client.post("/plans/import", json=missing_result)
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    r = client.post("/plans/import", json=dict(bundle, unexpected=1))
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    assert client.get("/plans").json()["total"] == 1  # only the source plan
+
+
+def test_import_unknown_dependency_reference_is_localized(client):
+    bundle = _crafted_bundle(
+        {
+            "name": None,
+            "services": ["a"],
+            "dependencies": [{"service": "a", "depends_on": "ghost"}],
+            "max_concurrency": 1,
+            "fault_domains": [],
+            "max_waves": None,
+        },
+        {
+            "waves": [{"index": 1, "services": ["a"]}],
+            "wave_count": 1,
+            "optimal": True,
+        },
+    )
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_dependency_target"
+    assert issue["service"] == "ghost"
+    assert client.get("/plans").json()["total"] == 0
+
+
+def test_import_unknown_fault_domain_member_is_localized(client):
+    bundle = _crafted_bundle(
+        {
+            "name": None,
+            "services": ["a", "b"],
+            "dependencies": [],
+            "max_concurrency": 2,
+            "fault_domains": [{"domain": "az-1", "services": ["a", "ghost"]}],
+            "max_waves": None,
+        },
+        {
+            "waves": [{"index": 1, "services": ["a", "b"]}],
+            "wave_count": 1,
+            "optimal": True,
+        },
+    )
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_fault_domain_member"
+    assert issue["service"] == "ghost"
+    assert issue["context"]["domain"] == "az-1"
+    assert client.get("/plans").json()["total"] == 0
+
+
+def test_import_dependency_cycle_is_localized(client):
+    bundle = _crafted_bundle(
+        {
+            "name": None,
+            "services": ["a", "b"],
+            "dependencies": [
+                {"service": "a", "depends_on": "b"},
+                {"service": "b", "depends_on": "a"},
+            ],
+            "max_concurrency": 2,
+            "fault_domains": [],
+            "max_waves": None,
+        },
+        {
+            "waves": [
+                {"index": 1, "services": ["a"]},
+                {"index": 2, "services": ["b"]},
+            ],
+            "wave_count": 2,
+            "optimal": True,
+        },
+    )
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    assert r.json()["issues"][0]["code"] == "dependency_cycle"
+    assert client.get("/plans").json()["total"] == 0
+
+
+def test_import_wave_count_mismatch(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+    bundle["result"]["wave_count"] = 2  # waves list still holds 3
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "bundle_wave_count_mismatch"
+    assert issue["context"]["declared_wave_count"] == 2
+    assert issue["context"]["actual_wave_count"] == 3
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_import_wave_index_not_contiguous(client):
+    plan = _create_plan(client)
+    bundle = _export_bundle(client, plan["id"])
+    bundle["result"]["waves"][1]["index"] = 5
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "bundle_wave_index_invalid" in codes
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_import_wave_service_mismatch(client):
+    plan = _create_plan(client)  # waves [[a], [b, c], [d]]
+    bundle = _export_bundle(client, plan["id"])
+    bundle["result"]["waves"] = [
+        {"index": 1, "services": ["a"]},
+        {"index": 2, "services": ["b", "c"]},
+        # d missing
+    ]
+    bundle["result"]["wave_count"] = 2
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "bundle_wave_service_mismatch"
+    assert issue["context"]["missing_services"] == ["d"]
+    assert issue["context"]["unknown_services"] == []
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_import_wave_concurrency_exceeded(client):
+    plan = _create_plan(client, {"services": ["a", "b"], "max_concurrency": 1})
+    bundle = _export_bundle(client, plan["id"])
+    bundle["result"]["waves"] = [{"index": 1, "services": ["a", "b"]}]
+    bundle["result"]["wave_count"] = 1
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "bundle_wave_concurrency_exceeded"
+    assert issue["context"]["wave"] == 1
+    assert issue["context"]["wave_size"] == 2
+    assert issue["context"]["max_concurrency"] == 1
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_import_wave_dependency_violation(client):
+    plan = _create_plan(client)  # [[a], [b, c], [d]]; b and c depend on a
+    bundle = _export_bundle(client, plan["id"])
+    # Swap a and b: b lands in wave 1 while its dependency a is in wave 2.
+    bundle["result"]["waves"] = [
+        {"index": 1, "services": ["b"]},
+        {"index": 2, "services": ["a", "c"]},
+        {"index": 3, "services": ["d"]},
+    ]
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issues = [
+        i
+        for i in r.json()["issues"]
+        if i["code"] == "bundle_wave_dependency_violation"
+    ]
+    assert issues
+    assert {i["service"] for i in issues} == {"b", "c"}
+    for issue in issues:
+        assert issue["related_services"] == ["a"]
+        assert issue["context"]["dependency_wave"] == 2
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_import_wave_fault_domain_violation(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b"]}],
+    }
+    plan = _create_plan(client, payload)  # a and b land in different waves
+    bundle = _export_bundle(client, plan["id"])
+    bundle["result"]["waves"] = [{"index": 1, "services": ["a", "b", "c"]}]
+    bundle["result"]["wave_count"] = 1
+    _resign(bundle)
+    r = client.post("/plans/import", json=bundle)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "bundle_wave_fault_domain_violation"
+    assert issue["context"]["domain"] == "az-1"
+    assert issue["context"]["services"] == ["a", "b"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_startup_migrates_pre_digest_databases(tmp_path):
+    # A database created before the digest column existed is migrated on
+    # startup: the column and index are added and existing rows are
+    # backfilled with the same digest a fresh export would produce.
+    import json
+    import sqlite3
+
+    from app import db as db_module
+
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            request_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            wave_count INTEGER NOT NULL,
+            optimal INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    result = {
+        "services": ["a", "b"],
+        "waves": [
+            {"index": 1, "services": ["a"]},
+            {"index": 2, "services": ["b"]},
+        ],
+        "max_concurrency": 1,
+        "max_waves": None,
+        "dependencies": [{"service": "b", "depends_on": "a"}],
+        "fault_domains": [],
+    }
+    conn.execute(
+        "INSERT INTO plans (name, request_json, result_json, wave_count, "
+        "optimal, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "legacy",
+            json.dumps({"services": ["a", "b"], "max_concurrency": 1}),
+            json.dumps(result),
+            2,
+            1,
+            "2026-09-01T00:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    db_module.init_db(path)
+    db_module.init_db(path)  # second startup is a no-op
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM plans").fetchone()
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(plans)")}
+    assert "digest" in columns
+    assert row["digest"] == bundle_digest(
+        {
+            "name": "legacy",
+            "services": ["a", "b"],
+            "dependencies": [{"service": "b", "depends_on": "a"}],
+            "max_concurrency": 1,
+            "fault_domains": [],
+            "max_waves": None,
+        },
+        {"waves": result["waves"], "wave_count": 2, "optimal": True},
+        API_VERSION,
+    )
+    conn.close()
