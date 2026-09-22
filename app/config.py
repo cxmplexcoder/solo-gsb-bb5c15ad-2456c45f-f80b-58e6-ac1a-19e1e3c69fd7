@@ -8,6 +8,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# API/container version, surfaced in exported bundle metadata. Kept here so
+# main.py, docker-compose.yml and the bundle module never drift apart.
+SERVICE_NAME = "release-wave-planner"
+SERVICE_VERSION = "1.5.0"
+
 
 def _get_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -49,7 +54,9 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
-        database_path=os.getenv("PLANNER_DB_PATH", "/data/plans.db"),
+        # Default to a local file so the service runs with zero
+        # configuration; the Docker image/compose override this to /data.
+        database_path=os.getenv("PLANNER_DB_PATH", "./data/plans.db"),
         solver_time_limit_seconds=_get_float("PLANNER_SOLVER_TIME_LIMIT", 10.0),
         solver_num_search_workers=_get_int("PLANNER_SOLVER_WORKERS", 1),
     )

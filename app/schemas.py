@@ -256,6 +256,19 @@ class PlanDeleted(BaseModel):
     deleted: bool = True
 
 
+class PlanImportResult(PlanResult):
+    """A plan restored from an offline bundle via POST /plans/import."""
+
+    sha256: str = Field(
+        ..., description="Canonical bundle digest the plan was imported from"
+    )
+    reused: bool = Field(
+        ...,
+        description="True when a plan with the same digest already existed "
+        "(idempotent replay); false when this call created a new plan",
+    )
+
+
 class ServiceWaveChange(BaseModel):
     service: str
     from_wave: int = Field(..., ge=1, description="Wave in the stored plan (1-based)")

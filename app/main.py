@@ -5,13 +5,20 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
 from .audit import audit_timeline
-from .config import Settings, load_settings
+from .bundle import (
+    PlanBundleEnvelope,
+    PlanImportRequest,
+    build_bundle,
+    digest_bundle,
+    prepare_import,
+)
+from .config import SERVICE_VERSION, Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
 from .planner import plan_release, simulate_plan
@@ -25,6 +32,7 @@ from .schemas import (
     Issue,
     PlanCreate,
     PlanDeleted,
+    PlanImportResult,
     PlanList,
     PlanResult,
     PlanSimulate,
@@ -49,16 +57,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.4.0",
+    version=SERVICE_VERSION,
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
         "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
         "impact of constraint changes on a stored plan, gate execution "
         "of a rollout against completed and failed services, preview "
-        "minimum rollback waves for the currently deployed services, and "
+        "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
-        "waves and dependency DAG."
+        "waves and dependency DAG, and offline-archive/restore complete "
+        "plans as content-addressed (SHA-256) JSON bundles."
     ),
     lifespan=lifespan,
 )
@@ -153,6 +162,13 @@ def _row_to_result(row: sqlite3.Row) -> PlanResult:
     )
 
 
+def _row_to_import_result(row: sqlite3.Row, digest: str, reused: bool) -> PlanImportResult:
+    base = _row_to_result(row)
+    return PlanImportResult(
+        **base.model_dump(), sha256=digest, reused=reused
+    )
+
+
 def _plan_not_found(plan_id: int) -> JSONResponse:
     body = ErrorBody(
         error="not_found",
@@ -194,6 +210,17 @@ def create_plan(
     output, domains = plan_release(payload, settings)
 
     request_payload = payload.model_dump()
+    # Normalize declaration order so equivalent requests are stored
+    # identically (and therefore share one canonical bundle digest).
+    request_payload["services"] = sorted(payload.services)
+    request_payload["dependencies"] = [
+        {"service": s, "depends_on": d}
+        for s, d in sorted({(x.service, x.depends_on) for x in payload.dependencies})
+    ]
+    request_payload["fault_domains"] = [
+        {"domain": name, "services": sorted(members)}
+        for name, members in sorted((d["domain"], d["services"]) for d in domains)
+    ]
     result_payload = {
         "services": sorted(payload.services),
         "waves": [
@@ -202,13 +229,8 @@ def create_plan(
         ],
         "max_concurrency": payload.max_concurrency,
         "max_waves": payload.max_waves,
-        "dependencies": [
-            {"service": s, "depends_on": d}
-            for s, d in {
-                (x.service, x.depends_on) for x in payload.dependencies
-            }
-        ],
-        "fault_domains": domains,
+        "dependencies": request_payload["dependencies"],
+        "fault_domains": request_payload["fault_domains"],
     }
 
     plan_id = db.insert_plan(
@@ -275,6 +297,86 @@ def delete_plan(
     if not db.delete_plan(conn, plan_id):
         return _plan_not_found(plan_id)  # type: ignore[return-value]
     return PlanDeleted(id=plan_id)
+
+
+@app.get(
+    "/plans/{plan_id}/bundle",
+    response_model=PlanBundleEnvelope,
+    tags=["archive"],
+    responses={404: {"model": ErrorBody}},
+)
+def export_plan_bundle(
+    plan_id: int, conn: sqlite3.Connection = Depends(db.get_db)
+) -> PlanBundleEnvelope:
+    """Export a read-only, content-addressed offline archive of one plan.
+
+    The bundle contains the canonical request constraints, the immutable
+    stored solver result (waves are never recomputed) and format/version
+    metadata; instance-specific provenance rides alongside. ``sha256`` is
+    the digest of the bundle's canonical JSON (recursively sorted keys,
+    no insignificant whitespace) and therefore depends only on the plan
+    content, never on wire formatting. The stored plan is read but never
+    modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    request_payload = json.loads(row["request_json"])
+    result_payload = json.loads(row["result_json"])
+    bundle, provenance = build_bundle(
+        request_payload=request_payload,
+        result_payload=result_payload,
+        optimal=bool(row["optimal"]),
+        source_plan_id=row["id"],
+        created_at=row["created_at"],
+    )
+    return PlanBundleEnvelope(
+        sha256=digest_bundle(bundle), bundle=bundle, provenance=provenance
+    )
+
+
+@app.post(
+    "/plans/import",
+    response_model=PlanImportResult,
+    tags=["archive"],
+    responses={422: {"model": ErrorBody}},
+)
+def import_plan_bundle(
+    payload: PlanImportRequest,
+    response: Response,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> PlanImportResult:
+    """Restore a plan from an offline archive bundle.
+
+    Validation runs strictly before any write: the declared SHA-256 must
+    match the canonical bundle digest, the bundle must conform to the
+    archive schema (and declare a supported format/version), every
+    dependency edge and fault-domain member must reference a service of
+    the bundle, and the archived waves must satisfy the archived request
+    (wave contiguity and coverage, dependency ordering, per-wave
+    concurrency, fault-domain anti-affinity and the release window). The
+    archived wave assignment is then stored verbatim in a single
+    transaction — it is never re-solved. Replaying the same digest is
+    idempotent (200, ``reused=true``) and returns the existing plan; a
+    newly restored plan is answered with 201. Any failed validation
+    performs zero writes.
+    """
+    prepared = prepare_import(payload)
+
+    row, reused = db.import_plan(
+        conn,
+        prepared.name,
+        prepared.request_payload,
+        prepared.result_payload,
+        prepared.wave_count,
+        prepared.optimal,
+        prepared.digest,
+    )
+    response.status_code = (
+        status.HTTP_200_OK if reused else status.HTTP_201_CREATED
+    )
+    return _row_to_import_result(row, prepared.digest, reused=reused)
 
 
 @app.post(
